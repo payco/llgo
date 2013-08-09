@@ -7,6 +7,14 @@ type Stringer interface {
 type X int
 type Y int
 
+type Z1 struct {
+	X
+}
+
+type Z2 struct {
+	Stringer
+}
+
 func (x X) String() string {
 	return "X()"
 }
@@ -15,12 +23,22 @@ func (y *Y) String() string {
 	return "Y()"
 }
 
-func main() {
-	var z Stringer
-	z = X(0)
-	println(z.String())
-	//var y Y
-	//z = &y
-	//println(z.String())
+func makeX() X {
+	return X(0)
 }
 
+func main() {
+	var z Stringer = X(0)
+	println(z.String())
+
+	z = new(Y)
+	println(z.String())
+
+	z = Z1{}
+	println(z.String())
+
+	z = Z2{new(Y)}
+	println(z.String())
+
+	println(makeX().String())
+}

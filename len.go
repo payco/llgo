@@ -1,85 +1,68 @@
-/*
-Copyright (c) 2011, 2012 Andrew Wilkins <axwalk@gmail.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-*/
+// Copyright 2011 The llgo Authors.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 package llgo
 
 import (
-	"fmt"
-	"github.com/axw/llgo/types"
+	"code.google.com/p/go.tools/go/types"
+	"github.com/axw/gollvm/llvm"
 	"go/ast"
-	"go/token"
-	"strconv"
-	"unsafe"
 )
 
-func (c *compiler) VisitLen(expr *ast.CallExpr) Value {
-	if len(expr.Args) > 1 {
-		panic("Expecting only one argument to len")
-	}
-
+func (c *compiler) VisitCap(expr *ast.CallExpr) Value {
 	value := c.VisitExpr(expr.Args[0])
 	typ := value.Type()
-	if name, ok := typ.(*types.Name); ok {
-		typ = name.Underlying
+	if name, ok := typ.Underlying().(*types.Named); ok {
+		typ = name.Underlying()
 	}
-
-	switch typ := typ.(type) {
+	var capvalue llvm.Value
+	switch typ := typ.Underlying().(type) {
 	case *types.Pointer:
-		// XXX Converting to a string to be converted back to an int is
-		// silly. The values need an overhaul? Perhaps have types based
-		// on fundamental types, with the additional methods to make
-		// them llgo.Value's.
-		if a, isarray := typ.Base.(*types.Array); isarray {
-			return c.NewConstValue(token.INT,
-				strconv.FormatUint(a.Len, 10))
-		}
-		v := strconv.FormatUint(uint64(unsafe.Sizeof(uintptr(0))), 10)
-		return c.NewConstValue(token.INT, v)
-
+		atyp := typ.Elem().Underlying().(*types.Array)
+		capvalue = llvm.ConstInt(c.llvmtypes.inttype, uint64(atyp.Len()), false)
+	case *types.Array:
+		capvalue = llvm.ConstInt(c.llvmtypes.inttype, uint64(typ.Len()), false)
 	case *types.Slice:
-		//ptr := value.(*LLVMValue).pointer
-		//len_field := c.builder.CreateStructGEP(ptr.LLVMValue(), 1, "")
 		sliceval := value.LLVMValue()
-		lenval := c.builder.CreateExtractValue(sliceval, 1, "") //c.builder.CreateLoad(len_field, "")
-		return c.NewLLVMValue(lenval, types.Int32).Convert(types.Int)
+		capvalue = c.builder.CreateExtractValue(sliceval, 2, "")
+	case *types.Chan:
+		panic("cap(chan) unimplemented")
+	}
+	return c.NewValue(capvalue, types.Typ[types.Int])
+}
 
+func (c *compiler) VisitLen(expr *ast.CallExpr) Value {
+	value := c.VisitExpr(expr.Args[0])
+	typ := value.Type()
+	if name, ok := typ.Underlying().(*types.Named); ok {
+		typ = name.Underlying()
+	}
+	var lenvalue llvm.Value
+	switch typ := typ.Underlying().(type) {
+	case *types.Pointer:
+		atyp := typ.Elem().Underlying().(*types.Array)
+		lenvalue = llvm.ConstInt(c.llvmtypes.inttype, uint64(atyp.Len()), false)
+	case *types.Slice:
+		sliceval := value.LLVMValue()
+		lenvalue = c.builder.CreateExtractValue(sliceval, 1, "")
 	case *types.Map:
 		mapval := value.LLVMValue()
-		lenval := c.builder.CreateExtractValue(mapval, 0, "") //c.builder.CreateLoad(len_field, "")
-		return c.NewLLVMValue(lenval, types.Int32).Convert(types.Int)
-
+		f := c.NamedFunction("runtime.maplen", "func(m uintptr) int")
+		lenvalue = c.builder.CreateCall(f, []llvm.Value{mapval}, "")
 	case *types.Array:
-		v := strconv.FormatUint(typ.Len, 10)
-		return c.NewConstValue(token.INT, v)
-
+		lenvalue = llvm.ConstInt(c.llvmtypes.inttype, uint64(typ.Len()), false)
 	case *types.Basic:
-		if typ == types.String.Underlying {
-			ptr := value.(*LLVMValue).pointer
-			len_field := c.builder.CreateStructGEP(ptr.LLVMValue(), 1, "")
-			len_value := c.builder.CreateLoad(len_field, "")
-			return c.NewLLVMValue(len_value, types.Int32).Convert(types.Int)
+		if isString(typ) {
+			value := value.(*LLVMValue)
+			lenvalue = c.builder.CreateExtractValue(value.LLVMValue(), 1, "")
 		}
+	case *types.Chan:
+		chanval := value.LLVMValue()
+		f := c.NamedFunction("runtime.chanlen", "func(c uintptr) int")
+		lenvalue = c.builder.CreateCall(f, []llvm.Value{chanval}, "")
 	}
-	panic(fmt.Sprint("Unhandled value type: ", value.Type()))
+	return c.NewValue(lenvalue, types.Typ[types.Int])
 }
 
 // vim: set ft=go :

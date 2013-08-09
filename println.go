@@ -1,31 +1,13 @@
-/*
-Copyright (c) 2011, 2012 Andrew Wilkins <axwalk@gmail.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-*/
+// Copyright 2011 The llgo Authors.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 package llgo
 
 import (
+	"code.google.com/p/go.tools/go/types"
 	"fmt"
 	"github.com/axw/gollvm/llvm"
-	"github.com/axw/llgo/types"
 	"go/ast"
 )
 
@@ -63,7 +45,7 @@ func (c *compiler) getBoolString(v llvm.Value) llvm.Value {
 	return result
 }
 
-func (c *compiler) printValues(values ...Value) Value {
+func (c *compiler) printValues(println_ bool, values ...Value) Value {
 	var args []llvm.Value = nil
 	if len(values) > 0 {
 		format := ""
@@ -71,55 +53,62 @@ func (c *compiler) printValues(values ...Value) Value {
 		for i, value := range values {
 			llvm_value := value.LLVMValue()
 
-			// If it's a named type, get the underlying type.
-			typ := value.Type()
-			if name, isname := typ.(*types.Name); isname {
-				typ = name.Underlying
+			typ := value.Type().Underlying()
+			if name, isname := typ.(*types.Named); isname {
+				typ = name.Underlying()
 			}
 
-			if i > 0 {
+			if println_ && i > 0 {
 				format += " "
 			}
 			switch typ := typ.(type) {
 			case *types.Basic:
-				switch typ.Kind {
-				case types.UintKind:
-					format += "%lu"
-				case types.Uint8Kind:
+				switch typ.Kind() {
+				case types.Uint8:
 					format += "%hhu"
-				case types.Uint16Kind:
+				case types.Uint16:
 					format += "%hu"
-				case types.Uint32Kind, types.UintptrKind: // FIXME uintptr to become bitwidth dependent
+				case types.Uint32:
 					format += "%u"
-				case types.Uint64Kind:
+				case types.Uintptr, types.Uint:
+					format += "%lu"
+				case types.Uint64:
 					format += "%llu" // FIXME windows
-				case types.IntKind:
+				case types.Int:
 					format += "%ld"
-				case types.Int8Kind:
+				case types.Int8:
 					format += "%hhd"
-				case types.Int16Kind:
+				case types.Int16:
 					format += "%hd"
-				case types.Int32Kind:
+				case types.Int32:
 					format += "%d"
-				case types.Int64Kind:
+				case types.Int64:
 					format += "%lld" // FIXME windows
-				case types.StringKind:
+				case types.Float32:
+					llvm_value = c.builder.CreateFPExt(llvm_value, llvm.DoubleType(), "")
+					fallthrough
+				case types.Float64:
+					printfloat := c.NamedFunction("runtime.printfloat", "func(float64) string")
+					args := []llvm.Value{llvm_value}
+					llvm_value = c.builder.CreateCall(printfloat, args, "")
+					fallthrough
+				case types.String, types.UntypedString:
 					ptrval := c.builder.CreateExtractValue(llvm_value, 0, "")
 					lenval := c.builder.CreateExtractValue(llvm_value, 1, "")
 					llvm_value = ptrval
 					args = append(args, lenval)
 					format += "%.*s"
-				case types.BoolKind:
+				case types.Bool:
 					format += "%s"
 					llvm_value = c.getBoolString(llvm_value)
-				case types.UnsafePointerKind:
+				case types.UnsafePointer:
 					format += "%p"
 				default:
 					panic(fmt.Sprint("Unhandled Basic Kind: ", typ.Kind))
 				}
 
 			case *types.Interface:
-				format += "(%p %p)"
+				format += "(0x%lx,0x%lx)"
 				ival := c.builder.CreateExtractValue(llvm_value, 0, "")
 				itype := c.builder.CreateExtractValue(llvm_value, 1, "")
 				args = append(args, ival)
@@ -129,48 +118,59 @@ func (c *compiler) printValues(values ...Value) Value {
 				// If we see a constant array, we either:
 				//     Create an internal constant if it's a constant array, or
 				//     Create space on the stack and store it there.
-				init_ := value
-				init_value := init_.LLVMValue()
-				switch init_.(type) {
-				case ConstValue:
-					llvm_value = llvm.AddGlobal(
-						c.module.Module, init_value.Type(), "")
-					llvm_value.SetInitializer(init_value)
-					llvm_value.SetGlobalConstant(true)
-					llvm_value.SetLinkage(llvm.InternalLinkage)
-				case *LLVMValue:
-					llvm_value = c.builder.CreateAlloca(
-						init_value.Type(), "")
+				init_ := value.(*LLVMValue)
+				if init_.pointer != nil {
+					llvm_value = init_.pointer.LLVMValue()
+				} else {
+					init_value := init_.LLVMValue()
+					llvm_value = c.builder.CreateAlloca(init_value.Type(), "")
 					c.builder.CreateStore(init_value, llvm_value)
 				}
 				// FIXME don't assume string...
 				format += "%s"
 
 			case *types.Pointer:
-				format += "0x%x"
+				format += "0x%lx"
 
 			default:
-				panic(fmt.Sprint("Unhandled type kind: ", typ))
+				panic(fmt.Sprintf("Unhandled type kind: %s (%T)", typ, typ))
 			}
 
 			args = append(args, llvm_value)
 		}
-		format += "\n"
+		if println_ {
+			format += "\n"
+		}
 		formatval := c.builder.CreateGlobalStringPtr(format, "")
 		args = append([]llvm.Value{formatval}, args...)
 	} else {
-		args = []llvm.Value{c.builder.CreateGlobalStringPtr("\n", "")}
+		var format string
+		if println_ {
+			format = "\n"
+		}
+		args = []llvm.Value{c.builder.CreateGlobalStringPtr(format, "")}
 	}
 	printf := getprintf(c.module.Module)
-	return c.NewLLVMValue(c.builder.CreateCall(printf, args, ""), types.Int32)
+	result := c.NewValue(c.builder.CreateCall(printf, args, ""), types.Typ[types.Int32])
+	fflush := c.NamedFunction("fflush", "func(*int32) int32")
+	c.builder.CreateCall(fflush, []llvm.Value{llvm.ConstNull(llvm.PointerType(llvm.Int32Type(), 0))}, "")
+	return result
 }
 
-func (c *compiler) VisitPrintln(expr *ast.CallExpr) Value {
+func (c *compiler) visitPrint(expr *ast.CallExpr) Value {
 	var values []Value
 	for _, arg := range expr.Args {
 		values = append(values, c.VisitExpr(arg))
 	}
-	return c.printValues(values...)
+	return c.printValues(false, values...)
+}
+
+func (c *compiler) visitPrintln(expr *ast.CallExpr) Value {
+	var values []Value
+	for _, arg := range expr.Args {
+		values = append(values, c.VisitExpr(arg))
+	}
+	return c.printValues(true, values...)
 }
 
 // vim: set ft=go :
