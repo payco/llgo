@@ -1,221 +1,327 @@
-/*
-Copyright (c) 2011, 2012 Andrew Wilkins <axwalk@gmail.com>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-*/
+// Copyright 2012 The llgo Authors.
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file.
 
 package llgo
 
 import (
+	"bytes"
+	"code.google.com/p/go.tools/go/types"
 	"fmt"
-	"github.com/axw/llgo/types"
 	"go/ast"
-	"math/big"
+	"sort"
 )
 
-// Get a Type from an ast object.
-func (c *compiler) ObjGetType(obj *ast.Object) types.Type {
-	if obj != nil {
-		switch type_ := obj.Type.(type) {
-		case types.Type:
-			return type_
-		}
+// XXX the below function is a clone of the one from llgo/types.
+// this is used to check whether a "function call" is in fact a
+// type conversion.
 
-		switch x := (obj.Decl).(type) {
-		case *ast.TypeSpec:
-			c.VisitTypeSpec(x)
-			type_, _ := (obj.Type).(types.Type)
-			return type_
-		}
-	}
-	return nil
-}
-
-func (c *compiler) GetType(expr ast.Expr) types.Type {
-	switch x := (expr).(type) {
+// isType checks if an expression is a type.
+func (c *compiler) isType(x ast.Expr) bool {
+	switch t := x.(type) {
 	case *ast.Ident:
-		obj := c.LookupObj(x.Name)
-		return c.ObjGetType(obj)
-	case *ast.FuncType:
-		return c.VisitFuncType(x)
-	case *ast.MapType:
-		return c.VisitMapType(x)
-	case *ast.ArrayType:
-		elttype := c.GetType(x.Elt)
-		if x.Len == nil {
-			return &types.Slice{Elt: elttype}
-		} else {
-			result := &types.Array{Elt: elttype}
-			_, isellipsis := (x.Len).(*ast.Ellipsis)
-			if !isellipsis {
-				lenvalue := c.VisitExpr(x.Len)
-				constval, isconst := lenvalue.(ConstValue)
-				if !isconst {
-					panic("Array length must be a constant integer expression")
-				}
-				intval, isint := (constval.Val).(*big.Int)
-				if !isint {
-					panic("Array length must be a constant integer expression")
-				}
-				result.Len = uint64(intval.Int64())
-			}
-			return result
+		if obj, ok := c.typeinfo.Objects[t]; ok {
+			_, ok = obj.(*types.TypeName)
+			return ok
 		}
-	case *ast.StructType:
-		return c.VisitStructType(x)
-	case *ast.InterfaceType:
-		return c.VisitInterfaceType(x)
+	case *ast.ParenExpr:
+		return c.isType(t.X)
+	case *ast.SelectorExpr:
+		// qualified identifier
+		if ident, ok := t.X.(*ast.Ident); ok {
+			if obj, ok := c.typeinfo.Objects[ident]; ok {
+				if pkg, ok := obj.(*types.Package); ok {
+					obj := pkg.Scope().Lookup(t.Sel.Name)
+					_, ok = obj.(*types.TypeName)
+					return ok
+				}
+				return false
+			}
+		}
+		return false
 	case *ast.StarExpr:
-		return &types.Pointer{Base: c.GetType(x.X)}
-	case *ast.Ellipsis:
-		return c.GetType(x.Elt)
+		return c.isType(t.X)
+	case *ast.ArrayType,
+		*ast.StructType,
+		*ast.FuncType,
+		*ast.InterfaceType,
+		*ast.MapType,
+		*ast.ChanType:
+		return true
+	}
+	return false
+}
+
+func (c *compiler) convertUntyped(from ast.Expr, to interface{}) bool {
+	fromtype := c.typeinfo.Types[from]
+	if fromtype != nil && isUntyped(fromtype) {
+		var newtype types.Type
+		switch to := to.(type) {
+		case types.Type:
+			newtype = to
+		case *ast.Ident:
+			obj := c.typeinfo.Objects[to]
+			newtype = obj.Type()
+		case ast.Expr:
+			newtype = c.typeinfo.Types[to]
+		default:
+			panic(fmt.Errorf("unexpected type: %T", to))
+		}
+
+		// If untyped constant is assigned to interface{},
+		// we'll change its type to the default type for
+		// the literal instead.
+		if fromtype != types.Typ[types.UntypedNil] {
+			if _, ok := newtype.(*types.Interface); ok {
+				newtype = defaultType(fromtype)
+			}
+		}
+
+		c.typeinfo.Types[from] = newtype
+		return true
+	}
+	return false
+}
+
+func deref(t types.Type) types.Type {
+	if p, ok := t.(*types.Pointer); ok {
+		return p.Elem()
+	}
+	return t
+}
+
+func (c *compiler) exportRuntimeTypes() {
+	if c.pkg.Path() == "runtime" {
+		kinds := [...]types.BasicKind{
+			types.Uint,
+			types.Uint8,
+			types.Uint16,
+			types.Uint32,
+			types.Uint64,
+			types.Int,
+			types.Int8,
+			types.Int16,
+			types.Int32,
+			types.Int64,
+			types.Float32,
+			types.Float64,
+			types.Complex64,
+			types.Complex128,
+			types.Bool,
+			types.Uintptr,
+			types.UnsafePointer,
+			types.String,
+		}
+		for _, kind := range kinds {
+			c.exportedtypes = append(c.exportedtypes, types.Typ[kind])
+		}
+		error_ := types.Universe.Lookup("error").Type()
+		c.exportedtypes = append(c.exportedtypes, error_)
+	}
+	for _, typ := range c.exportedtypes {
+		c.types.ToRuntime(typ)
+		c.types.ToRuntime(types.NewPointer(typ))
+	}
+}
+
+func fieldIndex(s *types.Struct, name string) int {
+	for i := 0; i < s.NumFields(); i++ {
+		f := s.Field(i)
+		if f.Name() == name {
+			return i
+		}
+	}
+	return -1
+}
+
+type objectsByName []types.Object
+
+func (o objectsByName) Len() int {
+	return len(o)
+}
+
+func (o objectsByName) Less(i, j int) bool {
+	return o[i].Name() < o[j].Name()
+}
+
+func (o objectsByName) Swap(i, j int) {
+	o[i], o[j] = o[j], o[i]
+}
+
+// TODO interfaces' methods should probably
+// out of go/types already sorted. If not,
+// cache sortedMethods.
+func sortedMethods(iface *types.Interface) []*types.Func {
+	objects := make([]types.Object, iface.NumMethods())
+	for i := 0; i < len(objects); i++ {
+		objects[i] = iface.Method(i)
+	}
+	sort.Sort(objectsByName(objects))
+	methods := make([]*types.Func, len(objects))
+	for i, o := range objects {
+		methods[i] = o.(*types.Func)
+	}
+	return methods
+}
+
+type TypeStringer struct {
+	pkgmap map[*types.TypeName]*types.Package
+}
+
+func (ts *TypeStringer) TypeKey(typ types.Type) string {
+	var buf bytes.Buffer
+	ts.writeType(&buf, typ, true)
+	return buf.String()
+}
+
+// typeString returns a string representation for typ.
+// below code based on go/types' typeString and friends.
+func (ts *TypeStringer) TypeString(typ types.Type) string {
+	var buf bytes.Buffer
+	ts.writeType(&buf, typ, false)
+	return buf.String()
+}
+
+func (ts *TypeStringer) writeParams(buf *bytes.Buffer, params *types.Tuple, isVariadic, unique bool) {
+	buf.WriteByte('(')
+	for i := 0; i < int(params.Len()); i++ {
+		par := params.At(i)
+		partyp := par.Type()
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		if isVariadic && i == int(params.Len()-1) {
+			buf.WriteString("...")
+			partyp = partyp.(*types.Slice).Elem()
+		}
+		ts.writeType(buf, partyp, unique)
+	}
+	buf.WriteByte(')')
+}
+
+func (ts *TypeStringer) writeSignature(buf *bytes.Buffer, sig *types.Signature, unique bool) {
+	if recv := sig.Recv(); recv != nil {
+		if _, ok := recv.Type().Underlying().(*types.Interface); !ok {
+			ts.writeType(buf, recv.Type(), unique)
+			buf.WriteByte(' ')
+		}
+	}
+
+	ts.writeParams(buf, sig.Params(), sig.IsVariadic(), unique)
+	if sig.Results().Len() == 0 {
+		// no result
+		return
+	}
+
+	buf.WriteByte(' ')
+	if sig.Results().Len() == 1 {
+		// single unnamed result
+		ts.writeType(buf, sig.Results().At(0).Type(), unique)
+		return
+	}
+
+	// multiple or named result(s)
+	ts.writeParams(buf, sig.Results(), false, unique)
+}
+
+func (ts *TypeStringer) writeType(buf *bytes.Buffer, typ types.Type, unique bool) {
+	switch t := typ.(type) {
+	case nil:
+		buf.WriteString("<nil>")
+
+	case *types.Basic:
+		// De-alias.
+		t = types.Typ[t.Kind()]
+		buf.WriteString(t.Name())
+
+	case *types.Array:
+		fmt.Fprintf(buf, "[%d]", t.Len())
+		ts.writeType(buf, t.Elem(), unique)
+
+	case *types.Slice:
+		buf.WriteString("[]")
+		ts.writeType(buf, t.Elem(), unique)
+
+	case *types.Struct:
+		buf.WriteString("struct{")
+		for i := 0; i < t.NumFields(); i++ {
+			f := t.Field(i)
+			if i > 0 {
+				buf.WriteString("; ")
+			}
+			if !f.Anonymous() {
+				buf.WriteString(f.Name())
+				buf.WriteByte(' ')
+			}
+			ts.writeType(buf, f.Type(), unique)
+			if tag := t.Tag(i); tag != "" {
+				fmt.Fprintf(buf, " %q", tag)
+			}
+		}
+		buf.WriteByte('}')
+
+	case *types.Pointer:
+		buf.WriteByte('*')
+		ts.writeType(buf, t.Elem(), unique)
+
+	case *types.Tuple:
+		ts.writeParams(buf, t, false, unique)
+
+	case *types.Signature:
+		buf.WriteString("func")
+		ts.writeSignature(buf, t, unique)
+
+	case *types.Interface:
+		buf.WriteString("interface{")
+		for i, m := range sortedMethods(t) {
+			if i > 0 {
+				buf.WriteString("; ")
+			}
+			buf.WriteString(m.Name())
+			ts.writeSignature(buf, m.Type().(*types.Signature), unique)
+		}
+		buf.WriteByte('}')
+
+	case *types.Map:
+		buf.WriteString("map[")
+		ts.writeType(buf, t.Key(), unique)
+		buf.WriteByte(']')
+		ts.writeType(buf, t.Elem(), unique)
+
+	case *types.Chan:
+		var s string
+		switch t.Dir() {
+		case ast.SEND:
+			s = "chan<- "
+		case ast.RECV:
+			s = "<-chan "
+		default:
+			s = "chan "
+		}
+		buf.WriteString(s)
+		ts.writeType(buf, t.Elem(), unique)
+
+	case *types.Named:
+		obj := t.Obj()
+		if pkg := ts.pkgmap[obj]; pkg != nil && pkg.Path() != "" {
+			buf.WriteString(pkg.Path())
+			buf.WriteByte('.')
+		}
+		buf.WriteString(obj.Name())
+
+		// pkg.name may exist in multiple scopes within a package,
+		// so we must add the object's pointer (which is unique)
+		// to differentiate them.
+		//
+		// XXX Note that this is only to support the use of TypeString
+		// for generating unique keys in typemap. When go/types/typemap
+		// is ready, we should use that instead.
+		if unique {
+			buf.WriteByte('@')
+			buf.WriteString(fmt.Sprintf("%p", obj))
+		}
+
 	default:
-		value := c.VisitExpr(expr)
-		return value.(TypeValue).typ
+		fmt.Fprintf(buf, "<type %T>", t)
 	}
-	return nil
 }
-
-func (c *compiler) VisitFuncType(f *ast.FuncType) *types.Func {
-	var fn_type types.Func
-
-	if f.Params != nil && len(f.Params.List) > 0 {
-		final_param_type := f.Params.List[len(f.Params.List)-1].Type
-		if _, varargs := final_param_type.(*ast.Ellipsis); varargs {
-			fn_type.IsVariadic = true
-		}
-		for i := 0; i < len(f.Params.List); i++ {
-			namecount := len(f.Params.List[i].Names)
-			typ := c.GetType(f.Params.List[i].Type)
-			if namecount == 0 {
-				arg := ast.NewObj(ast.Var, "_")
-				arg.Type = typ
-				fn_type.Params = append(fn_type.Params, arg)
-			} else {
-				args := make([]*ast.Object, namecount)
-				for j := 0; j < namecount; j++ {
-					ident := f.Params.List[i].Names[j]
-					if ident != nil {
-						args[j] = ident.Obj
-					} else {
-						args[j] = ast.NewObj(ast.Var, "_")
-					}
-					args[j].Type = typ
-				}
-				fn_type.Params = append(fn_type.Params, args...)
-			}
-		}
-	}
-
-	if f.Results != nil {
-		for i := 0; i < len(f.Results.List); i++ {
-			namecount := len(f.Results.List[i].Names)
-			typ := c.GetType(f.Results.List[i].Type)
-			if namecount > 0 {
-				results := make([]*ast.Object, namecount)
-				for j := 0; j < namecount; j++ {
-					ident := f.Results.List[i].Names[j]
-					if ident != nil {
-						results[j] = ident.Obj
-					} else {
-						results[j] = ast.NewObj(ast.Var, "_")
-					}
-					results[j].Type = typ
-				}
-				fn_type.Results = append(fn_type.Results, results...)
-			} else {
-				result := ast.NewObj(ast.Var, "_")
-				result.Type = typ
-				fn_type.Results = append(fn_type.Results, result)
-			}
-		}
-	}
-
-	return &fn_type
-}
-
-func (c *compiler) VisitStructType(s *ast.StructType) *types.Struct {
-	var typ = new(types.Struct)
-	if s.Fields != nil && s.Fields.List != nil {
-		tags := make(map[*ast.Object]string)
-		var i int = 0
-		for _, field := range s.Fields.List {
-			fieldtype := c.GetType(field.Type)
-			if field.Names != nil {
-				for _, name := range field.Names {
-					obj := name.Obj
-					if obj == nil {
-						obj = ast.NewObj(ast.Var, "_")
-					}
-					obj.Type = fieldtype
-					typ.Fields = append(typ.Fields, obj)
-					if field.Tag != nil {
-						tags[obj] = field.Tag.Value
-					}
-				}
-				i += len(field.Names)
-			} else {
-				obj := ast.NewObj(ast.Var, "_")
-				obj.Type = fieldtype
-				typ.Fields = append(typ.Fields, obj)
-				if field.Tag != nil {
-					tags[obj] = field.Tag.Value
-				}
-				i++
-			}
-		}
-
-		typ.Tags = make([]string, len(typ.Fields))
-		for i, field := range typ.Fields {
-			// TODO unquote string?
-			typ.Tags[i] = tags[field]
-		}
-	}
-	return typ
-}
-
-func (c *compiler) VisitInterfaceType(i *ast.InterfaceType) *types.Interface {
-	var iface types.Interface
-	if i.Methods != nil && i.Methods.List != nil {
-		for _, field := range i.Methods.List {
-			if field.Names == nil {
-				// If field.Names is nil, then we have an embedded interface.
-				fmt.Println("==nil")
-				embedded := c.GetType(field.Type)
-
-				embedded_iface, isiface := embedded.(*types.Interface)
-				if isiface {
-					iface.Methods = append(iface.Methods,
-						embedded_iface.Methods...)
-				}
-			} else {
-				// TODO
-				fmt.Println("!=nil")
-			}
-		}
-	}
-	return &iface
-}
-
-func (c *compiler) VisitMapType(m *ast.MapType) *types.Map {
-	k, v := c.GetType(m.Key), c.GetType(m.Value)
-	return &types.Map{Key: k, Elt: v}
-}
-
-// vim: set ft=go :
